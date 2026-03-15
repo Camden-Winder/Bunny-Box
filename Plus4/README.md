@@ -12,6 +12,7 @@ The easiest way to install Happy Hare on your Qidi Plus4 is to use the provided 
    ```
    
 The script will backup your configurations, download the necessary files, prompt you for your serial ID, and automatically install Happy Hare.
+Don't forget to update the machine gcodes in the slicer to use the ones provided in the [slicer_machine_gcodes.md](./config_hh-standalone/slicer_machine_gcodes.md).
 
 ## MANUAL INSTALLATION
 

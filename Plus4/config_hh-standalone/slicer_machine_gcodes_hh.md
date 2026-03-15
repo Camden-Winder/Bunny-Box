@@ -22,6 +22,7 @@ SET_PRINT_STATS_INFO CURRENT_LAYER=1
 SET_PRINT_STATS_INFO TOTAL_LAYER={total_layer_count}
 ```
 
+The gcode below is a Qidi start g-code modified with Happy Hare (and thus can be copied into your slicer):
 ```
 MMU_START_SETUP INITIAL_TOOL={initial_tool} TOTAL_TOOLCHANGES=!total_toolchanges! REFERENCED_TOOLS=!referenced_tools! TOOL_COLORS=!colors! TOOL_TEMPS=!temperatures! TOOL_MATERIALS=!materials! FILAMENT_NAMES=!filament_names! PURGE_VOLUMES=!purge_volumes!
 MMU_START_CHECK
