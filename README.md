@@ -29,8 +29,8 @@ Bunny Box is the Qidi Box mod that allows you to ditch Qidi's closed-source, pro
 
  * **Happy Hare** - the Qidi fork has been developed and tested, but not yet pulled into mainline. You can find it [here](https://github.com/Wazzup77/Happy-Hare). The `bunnybox` branch is used as the installation source.
  * **Plus4** - works with  [here](Plus4), tested on Qidi's 1.7.3, FreeDi (so stock Klipper) and Kalico (with minor issues still to be resolved).
- * **Q2** - some people have it working already (note [53Aries](https://github.com/53Aries/Qidi-Q2-Box-Happy-Hare) and YY), to be added here soon.
- * **Max4** - work in progress. Happy Hare works, configs are not tested yet. Use at your own risk.
+ * **Q2** - testing in progress!
+ * **Max4** - NEEDS TESTERS! work in progress. Happy Hare works, configs are not tested yet. Use at your own risk.
 
  Should be compatible with Beacon/Cartographer mods.
 
