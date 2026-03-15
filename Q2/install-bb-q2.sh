@@ -157,18 +157,18 @@ else
 fi
 
 echo ""
-echo "==> Installing Happy Hare from WIP repo..."
-# Install the core Happy Hare software from its repository on the 'bunnybox' branch.
+echo "==> Installing Happy Hare..."
+# Install the core Happy Hare software from its repository.
 HH_DIR="$HOME/Happy-Hare"
 if [ -d "$HH_DIR" ]; then
     echo "Happy-Hare repository already exists at $HH_DIR. Pulling latest..."
     cd "$HH_DIR"
     git fetch
-    git checkout bunnybox
+    git checkout main
     git pull
     cd - >/dev/null
 else
-    git clone -b bunnybox https://github.com/Wazzup77/Happy-Hare.git "$HH_DIR"
+    git clone https://github.com/moggieuk/Happy-Hare.git "$HH_DIR"
 fi
 
 echo "Running Happy Hare install script..."
@@ -226,13 +226,30 @@ def modify_printer_cfg():
     if '[duplicate_pin_override]' not in content:
         content = '[duplicate_pin_override]\npins: THR:PA1\n\n' + content
     else:
-        # Ensure THR:PA1 is in the pins list if the section exists
-        def add_pin(match):
-            pins_line = match.group(0)
-            if 'THR:PA1' not in pins_line:
-                return pins_line.rstrip() + ', THR:PA1\n'
-            return pins_line
-        content = re.sub(r'(?m)^pins:.*$', add_pin, content)
+        # Improved section-aware replacement
+        section_pattern = re.compile(r'\[duplicate_pin_override\]', re.IGNORECASE)
+        section_match = section_pattern.search(content)
+        if section_match:
+            start_idx = section_match.end()
+            next_section = re.search(r'\n\[', content[start_idx:])
+            end_idx = start_idx + next_section.start() if next_section else len(content)
+            section_content = content[start_idx:end_idx]
+            
+            pins_match = re.search(r'(?m)^pins:.*$', section_content)
+            if pins_match:
+                pins_line = pins_match.group(0)
+                # Cleanup and ensure THR:PA1 is in the list
+                prefix, pins_str = pins_line.split(':', 1)
+                # Split by comma or space, filter out empty, then re-join with comma
+                pins_list = [p.strip() for p in pins_str.replace(',', ' ').split() if p.strip()]
+                if 'THR:PA1' not in pins_list:
+                    pins_list.append('THR:PA1')
+                new_line = f"{prefix}: {', '.join(pins_list)}"
+                new_section_content = section_content.replace(pins_line, new_line, 1)
+                content = content[:start_idx] + new_section_content + content[end_idx:]
+            else:
+                # Add pins: line to the section
+                content = content[:start_idx] + "\npins: THR:PA1" + content[start_idx:]
 
     # 4. Make sure Happy Hare files are included: `[include mmu/base/*.cfg]`
     if '[include mmu/base/*.cfg]' not in content:
