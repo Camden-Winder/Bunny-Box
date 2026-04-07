@@ -84,6 +84,7 @@ sudo service klipper restart
 +pins: THR:PA0
 +
 [filament_switch_sensor filament_switch_sensor]
+-pause_on_runout: True
 +pause_on_runout: False
 -runout_gcode:
 -            M118 Filament run out
