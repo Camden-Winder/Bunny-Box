@@ -51,14 +51,23 @@ if [ ! -d "$SCRIPT_DIR/config_hh-standalone" ]; then
     REPO_URL="https://github.com/Wazzup77/Happy-Hare-Plus4-Configs/archive/refs/heads/main.zip"
     ZIP_FILE="$TEMP_DIR/configs.zip"
     
-    # Download the repository zip
-    wget -qO "$ZIP_FILE" "$REPO_URL" || curl -sLo "$ZIP_FILE" "$REPO_URL"
-    if [ ! -f "$ZIP_FILE" ]; then
+    # Download the repository zip (prefer curl -fsSL so HTTP errors don't write a zero-byte file)
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSLo "$ZIP_FILE" "$REPO_URL" || rm -f "$ZIP_FILE"
+    fi
+    if [ ! -s "$ZIP_FILE" ] && command -v wget >/dev/null 2>&1; then
+        wget -qO "$ZIP_FILE" "$REPO_URL" || rm -f "$ZIP_FILE"
+    fi
+    if [ ! -s "$ZIP_FILE" ]; then
         echo "Error: Failed to download configuration files."
         exit 1
     fi
     
     # Unzip the contents
+    if ! command -v unzip >/dev/null 2>&1; then
+        echo "Error: 'unzip' is required but not installed. Install it with: sudo apt install unzip"
+        exit 1
+    fi
     unzip -q "$ZIP_FILE" -d "$TEMP_DIR"
     
     # Update SCRIPT_DIR to point to the extracted Q2 folder
@@ -122,6 +131,7 @@ echo "Configurations copied."
 echo ""
 echo "==> Configuring Serial Address..."
 # Find serial devices
+SERIAL_ID=""
 DETECTED_SERIAL=""
 if [ -d "/dev/serial/by-id" ]; then
     DETECTED_SERIAL=$(find /dev/serial/by-id -maxdepth 1 -iname "*QIDI_BOX*" 2>/dev/null | head -n 1)
@@ -144,9 +154,10 @@ fi
 if [ -n "$SERIAL_ID" ]; then
     MMU_CFG="$CONFIG_DIR/mmu/base/mmu.cfg"
     if [ -f "$MMU_CFG" ]; then
-        # Replace the serial line
+        # Replace the serial line (anchored so only top-level `serial:` entries match,
+        # not commented lines or keys like `custom_serial:`)
         tmp_cfg=$(mktemp)
-        sed "s|serial:.*|serial: $SERIAL_ID|g" "$MMU_CFG" > "$tmp_cfg"
+        awk -v serial="$SERIAL_ID" '{sub(/^[[:space:]]*serial:.*/, "serial: " serial)} 1' "$MMU_CFG" > "$tmp_cfg"
         mv "$tmp_cfg" "$MMU_CFG"
         echo "Updated serial in mmu.cfg"
     else
@@ -165,7 +176,10 @@ if [ -d "$HH_DIR" ]; then
     cd "$HH_DIR"
     git fetch
     git checkout main
-    git pull
+    git pull --rebase || {
+        echo "Warning: git pull failed. Resetting to match remote..."
+        git reset --hard origin/main
+    }
     cd - >/dev/null
 else
     git clone https://github.com/moggieuk/Happy-Hare.git "$HH_DIR"
@@ -190,7 +204,7 @@ if [ ! -f "$SV_CFG" ]; then
 fi
 # safely remove existing variable and append it again
 tmp_sv=$(mktemp)
-sed '/mmu__revision/d' "$SV_CFG" > "$tmp_sv"
+sed '/^mmu__revision[[:space:]]*=/d' "$SV_CFG" > "$tmp_sv"
 echo "mmu__revision = 0" >> "$tmp_sv"
 mv "$tmp_sv" "$SV_CFG"
 
@@ -199,11 +213,12 @@ echo "==> Modifying printer.cfg and gcode_macro.cfg..."
 
 # We use python because it handles multiline parsing and regex matching safely.
 # This prevents bash escaping issues when modifying the configuration files.
+export CONFIG_DIR
 python3 - << 'EOF'
 import os
 import re
 
-config_dir = os.path.expanduser("~/printer_data/config")
+config_dir = os.environ.get("CONFIG_DIR", os.path.expanduser("~/printer_data/config"))
 printer_cfg_path = os.path.join(config_dir, "printer.cfg")
 gcode_macro_cfg_path = os.path.join(config_dir, "gcode_macro.cfg")
 
@@ -222,34 +237,36 @@ def modify_printer_cfg():
     if '[include bunnybox_macros.cfg]' not in content:
         content = '[include bunnybox_macros.cfg]\n' + content
         
-    # 3. Add [duplicate_pin_override] if not present
+    # 3. Add [duplicate_pin_override] with THR:PA1 if not present
     if '[duplicate_pin_override]' not in content:
         content = '[duplicate_pin_override]\npins: THR:PA1\n\n' + content
     else:
-        # Improved section-aware replacement
-        section_pattern = re.compile(r'\[duplicate_pin_override\]', re.IGNORECASE)
-        section_match = section_pattern.search(content)
-        if section_match:
-            start_idx = section_match.end()
-            next_section = re.search(r'\n\[', content[start_idx:])
-            end_idx = start_idx + next_section.start() if next_section else len(content)
-            section_content = content[start_idx:end_idx]
-            
-            pins_match = re.search(r'(?m)^pins:.*$', section_content)
-            if pins_match:
-                pins_line = pins_match.group(0)
-                # Cleanup and ensure THR:PA1 is in the list
-                prefix, pins_str = pins_line.split(':', 1)
-                # Split by comma or space, filter out empty, then re-join with comma
+        # Ensure THR:PA1 is in the pins list using line-by-line approach
+        dup_lines = content.split('\n')
+        dup_new_lines = []
+        in_dup_section = False
+        pins_updated = False
+        for dup_line in dup_lines:
+            if dup_line.strip() == '[duplicate_pin_override]':
+                in_dup_section = True
+                dup_new_lines.append(dup_line)
+                continue
+            if in_dup_section and dup_line.strip().startswith('['):
+                if not pins_updated:
+                    dup_new_lines.append('pins: THR:PA1')
+                    pins_updated = True
+                in_dup_section = False
+            if in_dup_section and dup_line.strip().startswith('pins:'):
+                prefix, pins_str = dup_line.split(':', 1)
                 pins_list = [p.strip() for p in pins_str.replace(',', ' ').split() if p.strip()]
                 if 'THR:PA1' not in pins_list:
                     pins_list.append('THR:PA1')
-                new_line = f"{prefix}: {', '.join(pins_list)}"
-                new_section_content = section_content.replace(pins_line, new_line, 1)
-                content = content[:start_idx] + new_section_content + content[end_idx:]
-            else:
-                # Add pins: line to the section
-                content = content[:start_idx] + "\npins: THR:PA1" + content[start_idx:]
+                dup_line = f'{prefix}: {", ".join(pins_list)}'
+                pins_updated = True
+            dup_new_lines.append(dup_line)
+        if in_dup_section and not pins_updated:
+            dup_new_lines.append('pins: THR:PA1')
+        content = '\n'.join(dup_new_lines)
 
     # 4. Make sure Happy Hare files are included: `[include mmu/base/*.cfg]`
     if '[include mmu/base/*.cfg]' not in content:
@@ -324,10 +341,11 @@ def modify_gcode_macro_cfg():
     macros_to_comment = ['[gcode_macro PAUSE]', '[gcode_macro RESUME_PRINT]', '[gcode_macro RESUME]', '[gcode_macro CANCEL_PRINT]']
     
     for line in lines:
-        if any(line.strip().startswith(m) for m in macros_to_comment):
+        stripped = line.strip()
+        if any(stripped == m for m in macros_to_comment):
             in_macro_to_comment = True
-            
-        if in_macro_to_comment and line.strip().startswith('[') and not any(line.strip().startswith(m) for m in macros_to_comment):
+
+        if in_macro_to_comment and stripped.startswith('[') and not any(stripped == m for m in macros_to_comment):
             in_macro_to_comment = False
             
         if in_macro_to_comment and not line.strip().startswith('#'):
@@ -348,10 +366,6 @@ except Exception as e:
 EOF
 
 echo ""
-echo "==> Changing script permissions (just in case)..."
-if [ -f "$0" ]; then chmod +x "$0" 2>/dev/null || true; fi
-
-echo ""
 echo "==> Environment Sensor Installation..."
 read -p "Do you want to install the custom AHT10 environment sensor module? (Recommended) (Y/n) " INSTALL_AHT10 </dev/tty
 if [[ -z "$INSTALL_AHT10" ]] || [[ "$INSTALL_AHT10" =~ ^[Yy]$ ]]; then
@@ -370,11 +384,22 @@ if [[ -z "$INSTALL_AHT10" ]] || [[ "$INSTALL_AHT10" =~ ^[Yy]$ ]]; then
             echo "Backed up existing aht10.py to aht10.py.bak"
         fi
         
-        # Download new file
-        if wget -qO aht10.py https://raw.githubusercontent.com/Wazzup77/Bunny-Box/refs/heads/main/aht10.py; then
+        # Download to temp file first, verify integrity, then move into place.
+        # Prefer curl -fsSL (fails on HTTP errors); fall back to wget.
+        tmp_aht=$(mktemp)
+        AHT10_URL="https://raw.githubusercontent.com/Wazzup77/Bunny-Box/refs/heads/main/aht10.py"
+        dl_ok=1
+        if command -v curl >/dev/null 2>&1; then
+            curl -fsSLo "$tmp_aht" "$AHT10_URL" && dl_ok=0
+        elif command -v wget >/dev/null 2>&1; then
+            wget -qO "$tmp_aht" "$AHT10_URL" && dl_ok=0
+        fi
+        if [ $dl_ok -eq 0 ] && [ -s "$tmp_aht" ]; then
+            mv "$tmp_aht" aht10.py
             echo "Successfully downloaded custom aht10.py module"
         else
             echo "Failed to download custom aht10.py module"
+            rm -f "$tmp_aht"
         fi
         
         cd - >/dev/null
@@ -388,7 +413,7 @@ fi
 echo ""
 echo "==> Restarting Klipper..."
 if command -v sudo >/dev/null 2>&1; then
-    sudo service klipper restart || echo "Failed to restart klipper automatically. Please restart it manually."
+    sudo systemctl restart klipper || echo "Failed to restart klipper automatically. Please restart it manually."
     sudo systemctl restart moonraker || echo "Failed to restart moonraker."
 else
     echo "Could not find sudo. Please restart klipper manually."

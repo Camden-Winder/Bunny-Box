@@ -51,14 +51,23 @@ if [ ! -d "$SCRIPT_DIR/config_hh-standalone" ]; then
     REPO_URL="https://github.com/Wazzup77/Happy-Hare-Plus4-Configs/archive/refs/heads/main.zip"
     ZIP_FILE="$TEMP_DIR/configs.zip"
     
-    # Download the repository zip
-    wget -qO "$ZIP_FILE" "$REPO_URL" || curl -sLo "$ZIP_FILE" "$REPO_URL"
-    if [ ! -f "$ZIP_FILE" ]; then
+    # Download the repository zip (prefer curl -fsSL so HTTP errors don't write a zero-byte file)
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSLo "$ZIP_FILE" "$REPO_URL" || rm -f "$ZIP_FILE"
+    fi
+    if [ ! -s "$ZIP_FILE" ] && command -v wget >/dev/null 2>&1; then
+        wget -qO "$ZIP_FILE" "$REPO_URL" || rm -f "$ZIP_FILE"
+    fi
+    if [ ! -s "$ZIP_FILE" ]; then
         echo "Error: Failed to download configuration files."
         exit 1
     fi
     
     # Unzip the contents
+    if ! command -v unzip >/dev/null 2>&1; then
+        echo "Error: 'unzip' is required but not installed. Install it with: sudo apt install unzip"
+        exit 1
+    fi
     unzip -q "$ZIP_FILE" -d "$TEMP_DIR"
     
     # Update SCRIPT_DIR to point to the extracted Plus4 folder
@@ -103,15 +112,8 @@ if [ -f "$CONFIG_DIR/bunnybox_macros.cfg" ]; then cp "$CONFIG_DIR/bunnybox_macro
 echo "Backups saved to $BACKUP_DIR"
 
 echo ""
-echo "==> Select Configuration Variant:"
-echo "1) config_hh-standalone (Recommended)"
-echo "2) config_qidi-like (Not currently working)"
-read -p "Select variant [1/2, default 1]: " VARIANT_CHOICE </dev/tty
-if [ "$VARIANT_CHOICE" == "2" ]; then
-    CONFIG_VARIANT="config_qidi-like"
-else
-    CONFIG_VARIANT="config_hh-standalone"
-fi
+echo "==> Using Configuration Variant: config_hh-standalone (Recommended)"
+CONFIG_VARIANT="config_hh-standalone"
 
 if [ ! -d "$SCRIPT_DIR/$CONFIG_VARIANT" ]; then
     echo "Error: $CONFIG_VARIANT directory not found in $SCRIPT_DIR"
@@ -129,6 +131,7 @@ echo "Configurations copied."
 echo ""
 echo "==> Configuring Serial Address..."
 # Find serial devices
+SERIAL_ID=""
 DETECTED_SERIAL=""
 if [ -d "/dev/serial/by-id" ]; then
     DETECTED_SERIAL=$(find /dev/serial/by-id -maxdepth 1 -iname "*QIDI_BOX*" 2>/dev/null | head -n 1)
@@ -151,9 +154,10 @@ fi
 if [ -n "$SERIAL_ID" ]; then
     MMU_CFG="$CONFIG_DIR/mmu/base/mmu.cfg"
     if [ -f "$MMU_CFG" ]; then
-        # Replace the serial line
+        # Replace the serial line (anchored so only top-level `serial:` entries match,
+        # not commented lines or keys like `custom_serial:`)
         tmp_cfg=$(mktemp)
-        sed "s|serial:.*|serial: $SERIAL_ID|g" "$MMU_CFG" > "$tmp_cfg"
+        awk -v serial="$SERIAL_ID" '{sub(/^[[:space:]]*serial:.*/, "serial: " serial)} 1' "$MMU_CFG" > "$tmp_cfg"
         mv "$tmp_cfg" "$MMU_CFG"
         echo "Updated serial in mmu.cfg"
     else
@@ -172,7 +176,10 @@ if [ -d "$HH_DIR" ]; then
     cd "$HH_DIR"
     git fetch
     git checkout bunnybox
-    git pull
+    git pull --rebase || {
+        echo "Warning: git pull failed (likely due to upstream rebase). Resetting to match remote..."
+        git reset --hard origin/bunnybox
+    }
     cd - >/dev/null
 else
     git clone -b bunnybox https://github.com/Wazzup77/Happy-Hare.git "$HH_DIR"
@@ -197,7 +204,7 @@ if [ ! -f "$SV_CFG" ]; then
 fi
 # safely remove existing variable and append it again
 tmp_sv=$(mktemp)
-sed '/mmu__revision/d' "$SV_CFG" > "$tmp_sv"
+sed '/^mmu__revision[[:space:]]*=/d' "$SV_CFG" > "$tmp_sv"
 echo "mmu__revision = 0" >> "$tmp_sv"
 mv "$tmp_sv" "$SV_CFG"
 
@@ -206,11 +213,12 @@ echo "==> Modifying printer.cfg and gcode_macro.cfg..."
 
 # We use python because it handles multiline parsing and regex matching safely.
 # This prevents bash escaping issues when modifying the configuration files.
+export CONFIG_DIR
 python3 - << 'EOF'
 import os
 import re
 
-config_dir = os.path.expanduser("~/printer_data/config")
+config_dir = os.environ.get("CONFIG_DIR", os.path.expanduser("~/printer_data/config"))
 printer_cfg_path = os.path.join(config_dir, "printer.cfg")
 gcode_macro_cfg_path = os.path.join(config_dir, "gcode_macro.cfg")
 
@@ -229,7 +237,7 @@ def modify_printer_cfg():
     if '[include bunnybox_macros.cfg]' not in content:
         content = '[include bunnybox_macros.cfg]\n' + content
         
-    # 4. Make sure Happy Hare files are included: `[include mmu/base/*.cfg]`
+    # 3. Make sure Happy Hare files are included: `[include mmu/base/*.cfg]`
     # Happy Hare splits its logic into multiple base configs that are necessary for operation.
     if '[include mmu/base/*.cfg]' not in content:
         content = '[include mmu/base/*.cfg]\n' + content
@@ -307,10 +315,11 @@ def modify_gcode_macro_cfg():
     macros_to_comment = ['[gcode_macro PAUSE]', '[gcode_macro RESUME_PRINT]', '[gcode_macro RESUME]', '[gcode_macro CANCEL_PRINT]']
     
     for line in lines:
-        if any(line.strip().startswith(m) for m in macros_to_comment):
+        stripped = line.strip()
+        if any(stripped == m for m in macros_to_comment):
             in_macro_to_comment = True
-            
-        if in_macro_to_comment and line.strip().startswith('[') and not any(line.strip().startswith(m) for m in macros_to_comment):
+
+        if in_macro_to_comment and stripped.startswith('[') and not any(stripped == m for m in macros_to_comment):
             in_macro_to_comment = False
             
         if in_macro_to_comment and not line.strip().startswith('#'):
@@ -331,10 +340,6 @@ except Exception as e:
 EOF
 
 echo ""
-echo "==> Changing script permissions (just in case)..."
-if [ -f "$0" ]; then chmod +x "$0" 2>/dev/null || true; fi
-
-echo ""
 echo "==> Environment Sensor Installation..."
 read -p "Do you want to install the custom AHT10 environment sensor module? (Recommended) (Y/n) " INSTALL_AHT10 </dev/tty
 if [[ -z "$INSTALL_AHT10" ]] || [[ "$INSTALL_AHT10" =~ ^[Yy]$ ]]; then
@@ -353,11 +358,22 @@ if [[ -z "$INSTALL_AHT10" ]] || [[ "$INSTALL_AHT10" =~ ^[Yy]$ ]]; then
             echo "Backed up existing aht10.py to aht10.py.bak"
         fi
         
-        # Download new file
-        if wget -qO aht10.py https://raw.githubusercontent.com/Wazzup77/Bunny-Box/refs/heads/main/aht10.py; then
+        # Download to temp file first, verify integrity, then move into place.
+        # Prefer curl -fsSL (fails on HTTP errors); fall back to wget.
+        tmp_aht=$(mktemp)
+        AHT10_URL="https://raw.githubusercontent.com/Wazzup77/Bunny-Box/refs/heads/main/aht10.py"
+        dl_ok=1
+        if command -v curl >/dev/null 2>&1; then
+            curl -fsSLo "$tmp_aht" "$AHT10_URL" && dl_ok=0
+        elif command -v wget >/dev/null 2>&1; then
+            wget -qO "$tmp_aht" "$AHT10_URL" && dl_ok=0
+        fi
+        if [ $dl_ok -eq 0 ] && [ -s "$tmp_aht" ]; then
+            mv "$tmp_aht" aht10.py
             echo "Successfully downloaded custom aht10.py module"
         else
             echo "Failed to download custom aht10.py module"
+            rm -f "$tmp_aht"
         fi
         
         cd - >/dev/null
@@ -371,7 +387,7 @@ fi
 echo ""
 echo "==> Restarting Klipper..."
 if command -v sudo >/dev/null 2>&1; then
-    sudo service klipper restart || echo "Failed to restart klipper automatically. Please restart it manually."
+    sudo systemctl restart klipper || echo "Failed to restart klipper automatically. Please restart it manually."
     sudo systemctl restart moonraker || echo "Failed to restart moonraker."
 else
     echo "Could not find sudo. Please restart klipper manually."
