@@ -255,35 +255,65 @@ def modify_printer_cfg():
     if '[include bunnybox_macros.cfg]' not in content:
         content = '[include bunnybox_macros.cfg]\n' + content
         
-    # 3. Add [duplicate_pin_override] with THR:PA1 if not present
+    # 3. Ensure `[duplicate_pin_override]` exists with THR:PA1 in its pins list.
+    # Klipper accepts multi-line values (indented continuation lines), so we
+    # collect the full pins value (inline + continuations) and rewrite it as a
+    # single comma-separated line. This also repairs a previously-broken file
+    # where the installer left an orphaned continuation line after overwriting.
     if '[duplicate_pin_override]' not in content:
         content = '[duplicate_pin_override]\npins: THR:PA1\n\n' + content
     else:
-        # Ensure THR:PA1 is in the pins list using line-by-line approach
         dup_lines = content.split('\n')
         dup_new_lines = []
         in_dup_section = False
-        pins_updated = False
+        in_pins_value = False
+        pins_list = []
+        pins_emitted = False
+
         for dup_line in dup_lines:
-            if dup_line.strip() == '[duplicate_pin_override]':
+            stripped = dup_line.strip()
+
+            if stripped == '[duplicate_pin_override]':
                 in_dup_section = True
+                in_pins_value = False
                 dup_new_lines.append(dup_line)
                 continue
-            if in_dup_section and dup_line.strip().startswith('['):
-                if not pins_updated:
-                    dup_new_lines.append('pins: THR:PA1')
-                    pins_updated = True
+
+            if in_dup_section and stripped.startswith('['):
+                if not pins_emitted:
+                    if 'THR:PA1' not in pins_list:
+                        pins_list.append('THR:PA1')
+                    dup_new_lines.append('pins: ' + ', '.join(pins_list))
+                    pins_emitted = True
                 in_dup_section = False
-            if in_dup_section and dup_line.strip().startswith('pins:'):
-                prefix, pins_str = dup_line.split(':', 1)
-                pins_list = [p.strip() for p in pins_str.replace(',', ' ').split() if p.strip()]
-                if 'THR:PA1' not in pins_list:
-                    pins_list.append('THR:PA1')
-                dup_line = f'{prefix}: {", ".join(pins_list)}'
-                pins_updated = True
+                in_pins_value = False
+                dup_new_lines.append(dup_line)
+                continue
+
+            if in_dup_section:
+                if stripped.startswith('pins:'):
+                    _, inline_val = dup_line.split(':', 1)
+                    pins_list.extend([p.strip() for p in inline_val.replace(',', ' ').split() if p.strip()])
+                    in_pins_value = True
+                    continue
+                if in_pins_value and stripped and dup_line[0] in (' ', '\t'):
+                    pins_list.extend([p.strip() for p in stripped.replace(',', ' ').split() if p.strip()])
+                    continue
+                if in_pins_value:
+                    if not pins_emitted:
+                        if 'THR:PA1' not in pins_list:
+                            pins_list.append('THR:PA1')
+                        dup_new_lines.append('pins: ' + ', '.join(pins_list))
+                        pins_emitted = True
+                    in_pins_value = False
+
             dup_new_lines.append(dup_line)
-        if in_dup_section and not pins_updated:
-            dup_new_lines.append('pins: THR:PA1')
+
+        if in_dup_section and not pins_emitted:
+            if 'THR:PA1' not in pins_list:
+                pins_list.append('THR:PA1')
+            dup_new_lines.append('pins: ' + ', '.join(pins_list))
+
         content = '\n'.join(dup_new_lines)
 
     # 4. Make sure Happy Hare files are included: `[include mmu/base/*.cfg]`
