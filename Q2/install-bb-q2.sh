@@ -475,21 +475,28 @@ def modify_gcode_macro_cfg():
         '{% if printer.mmu.enabled %}'
     )
 
-    # 2. Comment out PAUSE, RESUME_PRINT, RESUME, CANCEL_PRINT blocks entirely
+    # 2. Comment out PAUSE, RESUME_PRINT, RESUME, CANCEL_PRINT, CLEAR_PAUSE
+    # blocks entirely. Klipper gcode command names are case-insensitive, so
+    # the match here is too — the Max4 stock config, for example, uses
+    # lowercase `[gcode_macro pause]`. CLEAR_PAUSE is included because some
+    # stock variants override it with a macro that references variables on
+    # RESUME_PRINT; leaving it active after we delete RESUME_PRINT would make
+    # the UI's "Clear Pause" button throw at runtime.
     lines = content.split('\n')
     new_lines = []
     in_macro_to_comment = False
-    macros_to_comment = ['[gcode_macro PAUSE]', '[gcode_macro RESUME_PRINT]', '[gcode_macro RESUME]', '[gcode_macro CANCEL_PRINT]']
+    macros_to_comment = {'pause', 'resume_print', 'resume', 'cancel_print', 'clear_pause'}
+    section_re = re.compile(r'^\[gcode_macro\s+([A-Za-z_][A-Za-z0-9_]*)\s*\]')
 
     for line in lines:
         stripped = line.strip()
-        if any(stripped == m for m in macros_to_comment):
+        match = section_re.match(stripped)
+        if match and match.group(1).lower() in macros_to_comment:
             in_macro_to_comment = True
-
-        if in_macro_to_comment and stripped.startswith('[') and not any(stripped == m for m in macros_to_comment):
+        elif in_macro_to_comment and stripped.startswith('['):
             in_macro_to_comment = False
 
-        if in_macro_to_comment and not line.strip().startswith('#'):
+        if in_macro_to_comment and not stripped.startswith('#'):
             new_lines.append('# ' + line)
         else:
             new_lines.append(line)
