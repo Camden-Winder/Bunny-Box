@@ -87,7 +87,8 @@ G91
 G1 X1 Z{-initial_layer_print_height-0.1}
 G1 X4
 G1 Z1 F480
-G90```
+G90
+```
 
 # MACHINE END G-CODE
 ```
@@ -133,7 +134,7 @@ G1 Z[layer_z]
 {elsif timelapse_type == 0} ; timelapse without wipe tower
 TIMELAPSE_TAKE_FRAME
 {endif}
-_MMU_UPDATE_HEIGHT HEIGHT={layer_num + 1} 
+_MMU_UPDATE_HEIGHT HEIGHT={layer_z}
 G92 E0
 SET_PRINT_STATS_INFO CURRENT_LAYER={layer_num + 1}
 ```
