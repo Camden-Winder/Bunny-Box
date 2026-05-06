@@ -478,17 +478,22 @@ def modify_pause_resume_cancel_cfg():
     with open(pause_resume_cancel_cfg_path, 'r') as f:
         content = f.read()
 
-    # 2. Comment out PAUSE, RESUME_PRINT, RESUME, CANCEL_PRINT, CLEAR_PAUSE
-    # blocks entirely. Klipper gcode command names are case-insensitive, so
-    # the match here is too — Max4 stock config uses lowercase
-    # `[gcode_macro pause]` / `[gcode_macro clear_pause]`. CLEAR_PAUSE is
-    # included because Max4's stock clear_pause references variables on
-    # RESUME_PRINT; leaving it active after we delete RESUME_PRINT would make
-    # the UI's "Clear Pause" button throw at runtime.
+    # 2. Comment out PAUSE, RESUME_PRINT, RESUME, CANCEL_PRINT, CLEAR_PAUSE,
+    # DETECT_INTERRUPTION blocks entirely. Klipper gcode command names are
+    # case-insensitive, so the match here is too — Max4 stock config uses
+    # lowercase `[gcode_macro pause]` / `[gcode_macro clear_pause]`.
+    # CLEAR_PAUSE is included because Max4's stock clear_pause references
+    # variables on RESUME_PRINT; leaving it active after we delete
+    # RESUME_PRINT would make the UI's "Clear Pause" button throw at runtime.
+    # DETECT_INTERRUPTION is commented out because bunnybox_macros.cfg
+    # provides a no-op replacement. We comment rather than `rename_existing`
+    # so it also works on mainline Klipper / FreeDi installs where the stock
+    # macro may be absent — `rename_existing` would otherwise fail with
+    # "Existing command 'DETECT_INTERRUPTION' not found in gcode_macro rename".
     lines = content.split('\n')
     new_lines = []
     in_macro_to_comment = False
-    macros_to_comment = {'pause', 'resume_print', 'resume', 'cancel_print', 'clear_pause'}
+    macros_to_comment = {'pause', 'resume_print', 'resume', 'cancel_print', 'clear_pause', 'detect_interruption'}
     section_re = re.compile(r'^\[gcode_macro\s+([A-Za-z_][A-Za-z0-9_]*)\s*\]')
 
     for line in lines:

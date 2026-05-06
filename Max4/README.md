@@ -140,12 +140,15 @@ gcode:
   SET_PRINT_MAIN_STATUS MAIN_STATUS=printing
 ```
 2. In `pause_resume_cancel.cfg`:
-    - Remove `PAUSE` (or comment it out).
+    - Remove `pause` / `PAUSE` (or comment it out — note Max4 stock uses lowercase).
     - Remove `RESUME_PRINT` (or comment it out).
     - Remove `RESUME` (or comment it out).
     - Remove `CANCEL_PRINT` (or comment it out).
+    - Remove `clear_pause` (or comment it out — references variables on `RESUME_PRINT` so it would throw after step 2 above).
 
-3. In `start_end.cfg`, comment out any `save_last_file` call inside `PRINT_START`. This is Qidi's power-loss recovery hook and sets `was_interrupted=True` in `saved_variables.cfg` on every print start; PLR is disabled under Happy Hare (see [DETECT_INTERRUPTION override](./config_hh-standalone/bunnybox_macros.cfg)) so the call is wasteful.
+3. If any config file in your install defines `[gcode_macro DETECT_INTERRUPTION]`, comment it out. `bunnybox_macros.cfg` provides a no-op replacement; commenting rather than using `rename_existing:` keeps the install working on mainline Klipper / FreeDi where the stock macro may already be absent. (Stock Max4 does not define this macro in any visible config — this step is a no-op for stock Max4 installs.)
+
+4. In `start_end.cfg`, comment out any `save_last_file` call inside `PRINT_START`. This is Qidi's power-loss recovery hook and sets `was_interrupted=True` in `saved_variables.cfg` on every print start; PLR is disabled under Happy Hare (see [DETECT_INTERRUPTION override](./config_hh-standalone/bunnybox_macros.cfg)) so the call is wasteful.
 
 </details>
 
