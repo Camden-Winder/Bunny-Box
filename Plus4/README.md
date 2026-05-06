@@ -156,7 +156,9 @@ gcode:
 
 5. Remove `CANCEL_PRINT` (or comment it out).
 
-6. Comment out the `save_last_file` call at the end of `PRINT_START`. This is Qidi's power-loss recovery hook and sets `was_interrupted=True` in `saved_variables.cfg` on every print start; PLR is disabled under Happy Hare (see [DETECT_INTERRUPTION override](./config_hh-standalone/bunnybox_macros.cfg)) so the call is wasteful.
+6. Remove `DETECT_INTERRUPTION` (or comment it out). `bunnybox_macros.cfg` provides a no-op replacement; commenting the stock macro out (rather than relying on `rename_existing:`) keeps the install working on mainline Klipper / FreeDi where the stock macro may already be absent.
+
+7. Comment out the `save_last_file` call at the end of `PRINT_START`. This is Qidi's power-loss recovery hook and sets `was_interrupted=True` in `saved_variables.cfg` on every print start; PLR is disabled under Happy Hare (see [DETECT_INTERRUPTION override](./config_hh-standalone/bunnybox_macros.cfg)) so the call is wasteful.
 ```diff
      SET_PRINT_STATS_INFO CURRENT_LAYER=1
      ENABLE_ALL_SENSOR
