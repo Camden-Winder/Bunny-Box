@@ -35,7 +35,7 @@ Credit for the CAD files goes to [@fxwoody](https://www.youtube.com/@frankthebum
 
 8. In mmu_hardware.cfg `SENSORS` section, add (*TBD - YOU NEED TO FIGURE THIS OUT YOURSELF, THIS IS A TEMP PLACEHOLDER*):
 ```
-sync_feedback_analog_pin: 			# The ADC pin where the proportional filament pressure sensor is installed
+sync_feedback_analog_pin: PC3 			# The ADC pin where the proportional filament pressure sensor is installed
 sync_feedback_analog_max_compression: 1		# Raw sensor reading at max filament compression (buffer squeezed)
 sync_feedback_analog_max_tension: 0		# Raw sensor reading at max filament tension (buffer expanded)
 sync_feedback_analog_neutral_point: 0.50	# Biasing of neutral point (sensor value 0). Normally close to 0.5
