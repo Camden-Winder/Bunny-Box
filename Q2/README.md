@@ -8,7 +8,7 @@ The easiest way to install Happy Hare on your Qidi Q2 is to use the provided aut
 1. **Connect to your printer** via SSH.
 2. **Download and run the script**:
    ```bash
-   wget -qO - https://raw.githubusercontent.com/Wazzup77/Bunny-Box/refs/heads/main/Q2/install-bb-q2.sh | bash
+   wget -qO - https://raw.githubusercontent.com/Camden-Winder/Bunny-Box/refs/heads/main/Q2/install-bb-q2.sh | bash
    ```
    
 The script will backup your configurations, download the necessary files, prompt you for your serial ID, and automatically install Happy Hare.
