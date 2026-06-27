@@ -1,5 +1,21 @@
 # Bunny-Box Session Handoff Log
 
+## docs — Add Claude-facing documentation
+
+### What was done
+
+- `CLAUDE.md` created — repo conventions, layout, critical rules, variant table, PR conventions, troubleshooting protocol
+- `.claude/LESSONS.md` created — empty, ready for entries
+- `.claude/checklist.md` created — pre-commit and pre-merge checklists
+- `.claude/commands/start.md` created — session startup protocol
+- `.claude/commands/create-pr.md` created — PR creation command (targets `Camden-Winder/Bunny-Box`)
+- `.claude/session_brief.md` created — session brief format (identical to Superuser repo)
+- `.claude/settings.json` created — pre-approved permissions and attribution disabled
+- `.claudeignore` created
+- `.github/PULL_REQUEST_TEMPLATE.md` created
+
+---
+
 ## Session: 2026-06-19 — Strip Backup/Revert Logic
 
 **Branch:** `claude/loving-curie-79ogp0`

@@ -1,0 +1,30 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:www.klipper3d.org)",
+      "WebFetch(domain:moonraker.readthedocs.io)",
+      "WebFetch(domain:wiki.qidi3d.com)",
+      "WebFetch(domain:www.armoredturtle.xyz)",
+      "Bash(bash -n:*)",
+      "Bash(shellcheck:*)",
+      "Bash(git log:*)",
+      "Bash(git diff:*)",
+      "Bash(git status:*)",
+      "Bash(git fetch:*)",
+      "Bash(git branch:*)",
+      "Bash(grep:*)",
+      "Bash(find:*)",
+      "Bash(ls:*)",
+      "Edit(*)",
+      "Write(*)",
+      "MultiEdit(*)"
+    ]
+  },
+  "attribution": {
+    "commit": "",
+    "pr": "",
+    "sessionUrl": false
+  }
+}
