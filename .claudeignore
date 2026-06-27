@@ -1,0 +1,9 @@
+# Git
+.git/
+# IDE
+.vscode/
+.idea/
+.DS_Store
+# Images
+*.jpg
+*.png
