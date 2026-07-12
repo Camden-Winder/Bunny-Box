@@ -1,0 +1,1139 @@
+#!/usr/bin/env bash
+
+# Exit immediately if a command exits with a non-zero status
+set -e
+
+# =========================================================================
+# Happy Hare + Qidi Q2 Automatic Installation Script
+# =========================================================================
+# This script automates the installation of Happy Hare and configures
+# a Qidi Q2 for standalone usage. It can be run either from a cloned
+# repository or standalone (e.g., via wget or curl).
+# =========================================================================
+
+for arg in "$@"; do
+    case "$arg" in
+        -h|--help)
+            cat <<EOF
+Usage: $(basename "$0") [--help]
+
+Options:
+  -h, --help  Show this help message and exit.
+
+With no arguments, runs the interactive installer.
+EOF
+            exit 0
+            ;;
+        *)
+            echo "Unknown argument: $arg" >&2
+            echo "Use --help for usage." >&2
+            exit 1
+            ;;
+    esac
+done
+
+# Ensure the script is not run as root. Klipper and the user configuration
+# are expected to be owned and managed by the normal user (e.g. 'mks').
+if [ "$EUID" -eq 0 ]; then
+  echo "Please do not run this script as root. Run as your normal user (e.g. mks)."
+  exit 1
+fi
+
+# Validate this is a 01.01.02+ printer by checking the canonical home path.
+# On 01.01.02+, /home/mks is a symlink to /home/qidi. We require the
+# canonical path to be /home/qidi — if not, this is the wrong installer.
+CANONICAL_HOME=$(readlink -f "$HOME" 2>/dev/null || echo "$HOME")
+if [ "$CANONICAL_HOME" != "/home/qidi" ]; then
+    echo "ERROR: This installer is for 01.01.02+ firmware only."
+    echo "       Expected canonical home: /home/qidi"
+    echo "       Detected canonical home: $CANONICAL_HOME"
+    echo ""
+    echo "If you are on legacy firmware (1.1.0/1.1.1), use install-bb-q2.sh instead."
+    exit 1
+fi
+HOME_DIR="/home/qidi"
+
+# Define paths for Klipper configuration data.
+PRINTER_DATA_DIR="$HOME_DIR/printer_data"
+CONFIG_DIR="$PRINTER_DATA_DIR/config"
+
+# Set to 1 when we detect an existing install and the user chooses to update.
+# Drives the smart-merge path instead of a blind overwrite (see
+# smart_update_configs below).
+BB_UPDATE=0
+
+# Verify that the expected configuration directory exists.
+if [ ! -d "$CONFIG_DIR" ]; then
+    echo "Could not find Klipper config directory at $CONFIG_DIR"
+    echo "This script must be run on your printer."
+    exit 1
+fi
+
+# Ensure required tools are present. Qidi firmware images often ship without
+# git, and the standalone mode also needs unzip + curl/wget. Auto-install any
+# missing packages via apt-get (Qidi printers are Debian-based).
+echo "==> Checking dependencies..."
+NEEDED=()
+command -v git     >/dev/null 2>&1 || NEEDED+=(git)
+command -v python3 >/dev/null 2>&1 || NEEDED+=(python3)
+command -v unzip   >/dev/null 2>&1 || NEEDED+=(unzip)
+if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+    NEEDED+=(curl)
+fi
+if [ ${#NEEDED[@]} -gt 0 ]; then
+    echo "Installing missing packages: ${NEEDED[*]}"
+    if command -v sudo >/dev/null 2>&1 && command -v apt-get >/dev/null 2>&1; then
+        sudo apt-get update || echo "Warning: apt-get update failed, continuing..."
+        sudo apt-get install -y "${NEEDED[@]}"
+    else
+        echo "Error: Cannot auto-install (need sudo + apt-get). Install manually: ${NEEDED[*]}"
+        exit 1
+    fi
+fi
+
+# Locate the directory where this script resides.
+SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )
+
+# Check if the needed configuration directories exist next to the script.
+# If they do not, we assume the script is being run standalone (e.g. piped
+# from wget) and we need to download the repository configuration files.
+TEMP_DIR=""
+function cleanup() {
+    if [ -n "$TEMP_DIR" ] && [ -d "$TEMP_DIR" ]; then
+        echo "==> Cleaning up temporary files..."
+        rm -rf "$TEMP_DIR"
+    fi
+}
+# Register the cleanup function to run when the script exits (normally or on error).
+trap cleanup EXIT
+
+# Returns 0 if a bunnybox / Happy Hare install is detected on this printer.
+is_bb_installed() {
+    if [ -f "$CONFIG_DIR/bunnybox_macros.cfg" ]; then
+        return 0
+    fi
+    if [ -f "$CONFIG_DIR/printer.cfg" ] && grep -q '\[include bunnybox_macros.cfg\]' "$CONFIG_DIR/printer.cfg"; then
+        return 0
+    fi
+    return 1
+}
+
+# =========================================================================
+# Smart update machinery
+# =========================================================================
+# IMPORTANT — division of labour with Happy Hare's own installer:
+#
+# After we copy configs, this script runs Happy Hare's install.sh in upgrade
+# mode (INSTALL=0). HH's copy_config_files() then OWNS most of the mmu/ tree:
+#   - mmu_cut_tip/form_tip/sequence/purge/leds/software/state.cfg and
+#     optional/*.cfg are replaced with SYMLINKS into ~/Happy-Hare/config.
+#   - mmu_parameters.cfg / mmu_macro_vars.cfg / addon configs are re-templated
+#     with your existing values harvested forward.
+#   - mmu_vars.cfg (calibration) is kept if it already exists.
+# So a Bunny Box 3-way merge on those files is pointless (HH overwrites them)
+# and dangerous (writing onto a symlink would corrupt the HH clone).
+#
+# HH does NOT touch the files Bunny Box genuinely owns:
+#   - mmu/base/mmu_hardware.cfg  (Qidi pins — kept frozen in upgrade mode)
+#   - mmu/base/mmu.cfg           (serial + base — kept)
+#   - mmu/addons/*_hw.cfg        (Qidi cutter/eject pins — kept if present)
+#   - bunnybox_macros.cfg        (top-level Qidi integration — HH never sees it)
+#
+# These owned files are exactly where a smart merge has value: HH leaves them
+# alone, so without us new Bunny Box hardware/macro defaults would never reach
+# an existing install. We snapshot just these as the merge "base" in
+# $CONFIG_DIR/.bunnybox_base, so base/yours/new share one lineage and merge
+# cleanly. mmu_vars.cfg is left untouched (HH preserves it). Everything else is
+# delegated to HH's installer.
+
+# Marker/manifest locations inside the Klipper config directory. Dot-prefixed
+# so Klipper's [include ...] globs never pick them up.
+BB_BASE_DIR="$CONFIG_DIR/.bunnybox_base"
+BB_MANIFEST="$CONFIG_DIR/.bunnybox_manifest"
+
+# The set of files Bunny Box owns and smart-merges, relative to the variant
+# directory. Restricted to what HH's installer keeps frozen (see above) — the
+# rest of mmu/ is HH's responsibility. addons/*_hw.cfg is expanded per install.
+bb_managed_files() {
+    (
+        cd "$SCRIPT_DIR/$CONFIG_VARIANT" 2>/dev/null || return 0
+        local f
+        for f in bunnybox_macros.cfg mmu/base/mmu.cfg mmu/base/mmu_hardware.cfg \
+                 mmu/addons/*_hw.cfg; do
+            [ -f "$f" ] && echo "$f"
+        done | sort -u
+    )
+}
+
+# Show the upstream config changelog between the recorded commit and HEAD.
+# Only possible when the installer is run from a git clone (not standalone
+# zip) and a previous manifest recorded a real commit.
+bb_print_changelog() {
+    [ -f "$BB_MANIFEST" ] || return 0
+    local oldc newc
+    oldc=$(grep -E '^BB_COMMIT=' "$BB_MANIFEST" 2>/dev/null | head -n1 | cut -d= -f2 || true)
+    [ -n "$oldc" ] && [ "$oldc" != "unknown" ] || return 0
+    git -C "$SCRIPT_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 0
+    git -C "$SCRIPT_DIR" cat-file -e "${oldc}^{commit}" 2>/dev/null || return 0
+    newc=$(git -C "$SCRIPT_DIR" rev-parse HEAD 2>/dev/null || true)
+    if [ "$oldc" = "$newc" ]; then
+        echo "    Configs are already at the latest commit (${newc:0:8})."
+        return 0
+    fi
+    echo ""
+    echo "    Upstream config changes since your install (${oldc:0:8} -> ${newc:0:8}):"
+    git -C "$SCRIPT_DIR" log --oneline "${oldc}..HEAD" -- "$CONFIG_VARIANT" 2>/dev/null \
+        | sed 's/^/      /' || true
+}
+
+# Pretty-print one report category (skips empty categories).
+bb_report_list() {
+    local title="$1"; shift
+    [ "$#" -eq 0 ] && return 0
+    echo "    $title:"
+    local f
+    for f in "$@"; do echo "      - $f"; done
+}
+
+# The core smart update. Walks the Bunny Box-owned files (bb_managed_files)
+# and decides, per file, whether to keep, auto-update, 3-way merge, or ask.
+# Files outside this set (HH logic/params/calibration) are left for Happy
+# Hare's own installer, which runs immediately after.
+smart_update_configs() {
+    local src="$SCRIPT_DIR/$CONFIG_VARIANT"
+    local have_base=0
+    [ -d "$BB_BASE_DIR" ] && have_base=1
+
+    # Report buckets (global so they survive the loop / nested logic).
+    R_UPDATED=(); R_MERGED=(); R_KEPT=(); R_TOOKNEW=()
+    R_MARKERS=(); R_ADDED=(); R_REMOVED=()
+
+    echo ""
+    echo "==> Smart update: merging Bunny Box hardware/macro config with your setup..."
+    echo "    (Happy Hare's logic, parameters and calibration are upgraded separately"
+    echo "    by its own installer, run next.)"
+    if [ "$have_base" -eq 0 ]; then
+        echo "    No base snapshot found (this printer was set up before smart-update"
+        echo "    support). A 3-way merge isn't possible, so for any file that differs"
+        echo "    you'll be asked whether to keep yours or take the new one."
+    fi
+    bb_print_changelog
+
+    local rel new mine bcopy merged ans
+    while IFS= read -r rel; do
+        [ -n "$rel" ] || continue
+        new="$src/$rel"
+        mine="$CONFIG_DIR/$rel"
+        bcopy="$BB_BASE_DIR/$rel"
+        sudo mkdir -p "$(dirname "$mine")"
+
+        # Safety: never write through a symlink. A managed file shouldn't be a
+        # symlink (HH only symlinks the logic files we don't manage), but if it
+        # somehow is, a cp would write into the symlink target (e.g. the
+        # ~/Happy-Hare clone). Skip and warn instead.
+        if [ -L "$mine" ]; then
+            echo "  Skipping $rel — it is a symlink (managed elsewhere)."
+            continue
+        fi
+
+        # 1. Brand-new file we didn't ship before.
+        if [ ! -f "$mine" ]; then
+            sudo cp "$new" "$mine"; sudo chmod 644 "$mine"; R_ADDED+=("$rel"); continue
+        fi
+
+        # 3. Already identical to the new version — nothing to do.
+        if cmp -s "$mine" "$new"; then continue; fi
+
+        # 4. We have a merge base for this file -> classify precisely.
+        if [ "$have_base" -eq 1 ] && [ -f "$bcopy" ]; then
+            if cmp -s "$new" "$bcopy"; then
+                # Upstream unchanged; the difference is the user's own edit.
+                R_KEPT+=("$rel (your customisation, no upstream change)")
+                continue
+            fi
+            if cmp -s "$mine" "$bcopy"; then
+                # User never edited it; upstream changed -> adopt new default.
+                sudo cp "$new" "$mine"; sudo chmod 644 "$mine"; R_UPDATED+=("$rel"); continue
+            fi
+            # Both sides changed -> attempt a clean 3-way merge.
+            merged=$(mktemp)
+            if git merge-file -p "$mine" "$bcopy" "$new" > "$merged" 2>/dev/null; then
+                sudo cp "$merged" "$mine"; sudo chmod 644 "$mine"; rm -f "$merged"; R_MERGED+=("$rel"); continue
+            fi
+            rm -f "$merged"
+            # Conflict -> ask the user.
+            echo ""
+            echo "  CONFLICT: $rel"
+            echo "    Your edits overlap with new upstream changes in the same place."
+            while true; do
+                echo "      [k] keep YOUR version (default)"
+                echo "      [n] take the NEW version (your original file is left untouched)"
+                echo "      [m] write a merged copy with <<< conflict markers >>> to"
+                echo "          ${rel}.bbmerge (your live file is left untouched)"
+                echo "      [d] show the merge with markers, then ask again"
+                read -p "    Choose [k/n/m/d]: " ans </dev/tty || ans="k"
+                case "${ans:-k}" in
+                    k|K|"") R_KEPT+=("$rel (conflict — kept yours)"); break ;;
+                    n|N)    sudo cp "$new" "$mine"; sudo chmod 644 "$mine"; R_TOOKNEW+=("$rel"); break ;;
+                    m|M)    git merge-file -p --diff3 "$mine" "$bcopy" "$new" \
+                                > "${mine}.bbmerge" 2>/dev/null || true
+                            R_MARKERS+=("${rel}.bbmerge"); break ;;
+                    d|D)    git merge-file -p --diff3 "$mine" "$bcopy" "$new" 2>/dev/null \
+                                | sed 's/^/      | /' || true ;;
+                    *)      echo "    Please choose k, n, m, or d." ;;
+                esac
+            done
+            continue
+        fi
+
+        # 5. No merge base for this file: differs, can't merge -> ask.
+        echo ""
+        echo "  CHANGED (no merge base): $rel"
+        echo "    Your file differs from the new version and there is no recorded"
+        echo "    base to merge against."
+        while true; do
+            echo "      [k] keep YOUR version (default)"
+            echo "      [n] take the NEW version (your original file is left untouched)"
+            echo "      [d] show the diff (yours vs new), then ask again"
+            read -p "    Choose [k/n/d]: " ans </dev/tty || ans="k"
+            case "${ans:-k}" in
+                k|K|"") R_KEPT+=("$rel (no base — kept yours)"); break ;;
+                n|N)    sudo cp "$new" "$mine"; sudo chmod 644 "$mine"; R_TOOKNEW+=("$rel"); break ;;
+                d|D)    diff -u "$mine" "$new" | sed 's/^/      | /' || true ;;
+                *)      echo "    Please choose k, n, or d." ;;
+            esac
+        done
+    done < <(bb_managed_files)
+
+    # Report files that existed in the old base but are gone upstream. We do
+    # not delete them automatically (they may be user-added or still wanted).
+    if [ "$have_base" -eq 1 ]; then
+        local brel
+        while IFS= read -r brel; do
+            [ -n "$brel" ] || continue
+            if [ ! -f "$src/$brel" ] && [ -f "$CONFIG_DIR/$brel" ]; then
+                R_REMOVED+=("$brel")
+            fi
+        done < <( cd "$BB_BASE_DIR" 2>/dev/null && find . -type f | sed 's#^\./##' | sort )
+    fi
+
+    echo ""
+    echo "  ---------------- Update summary ----------------"
+    bb_report_list "Auto-updated (no local edits)"            "${R_UPDATED[@]}"
+    bb_report_list "Merged (your edits + new defaults)"       "${R_MERGED[@]}"
+    bb_report_list "Kept your version"                        "${R_KEPT[@]}"
+    bb_report_list "Replaced with new version"                "${R_TOOKNEW[@]}"
+    bb_report_list "Conflict copies to resolve manually"      "${R_MARKERS[@]}"
+    bb_report_list "New files added"                          "${R_ADDED[@]}"
+    bb_report_list "Removed upstream (left in place for you)" "${R_REMOVED[@]}"
+    echo "  ------------------------------------------------"
+}
+
+# Record what we just installed: a pristine snapshot of the Bunny Box-owned
+# files (the merge base for the NEXT update) and a manifest with the source
+# git commit. Only the managed files are snapshotted, so base/yours/new stay
+# on one lineage (HH-managed files are deliberately excluded — see
+# bb_managed_files). Called on both fresh installs and updates.
+write_install_manifest() {
+    sudo rm -rf "$BB_BASE_DIR"
+    local rel
+    while IFS= read -r rel; do
+        [ -n "$rel" ] || continue
+        sudo mkdir -p "$BB_BASE_DIR/$(dirname "$rel")"
+        sudo cp "$SCRIPT_DIR/$CONFIG_VARIANT/$rel" "$BB_BASE_DIR/$rel"
+    done < <(bb_managed_files)
+    local commit="unknown"
+    if git -C "$SCRIPT_DIR" rev-parse HEAD >/dev/null 2>&1; then
+        commit=$(git -C "$SCRIPT_DIR" rev-parse HEAD)
+    fi
+    sudo tee "$BB_MANIFEST" > /dev/null <<EOF
+BB_PRINTER=Q2
+BB_VARIANT=$CONFIG_VARIANT
+BB_COMMIT=$commit
+BB_INSTALL_DATE=$(date +"%Y-%m-%d %H:%M:%S")
+EOF
+    echo "==> Recorded install manifest (.bunnybox_manifest) and base snapshot (.bunnybox_base) for smart updates."
+}
+
+if [ ! -d "$SCRIPT_DIR/config_hh-standalone" ]; then
+    echo "==> Standalone execution detected. Downloading configuration files..."
+    TEMP_DIR=$(mktemp -d)
+    REPO_URL="https://github.com/Wazzup77/Happy-Hare-Plus4-Configs/archive/refs/heads/main.zip"
+    ZIP_FILE="$TEMP_DIR/configs.zip"
+    
+    # Download the repository zip (prefer curl -fsSL so HTTP errors don't write a zero-byte file)
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSLo "$ZIP_FILE" "$REPO_URL" || rm -f "$ZIP_FILE"
+    fi
+    if [ ! -s "$ZIP_FILE" ] && command -v wget >/dev/null 2>&1; then
+        wget -qO "$ZIP_FILE" "$REPO_URL" || rm -f "$ZIP_FILE"
+    fi
+    if [ ! -s "$ZIP_FILE" ]; then
+        echo "Error: Failed to download configuration files."
+        exit 1
+    fi
+    
+    # Unzip the contents
+    unzip -q "$ZIP_FILE" -d "$TEMP_DIR"
+    
+    # Update SCRIPT_DIR to point to the extracted Q2 folder
+    # We detect the extracted folder name dynamically:
+    EXTRACTED_DIR=$(find "$TEMP_DIR" -mindepth 1 -maxdepth 1 -type d | head -n 1)
+    SCRIPT_DIR="$EXTRACTED_DIR/Q2"
+    
+    if [ ! -d "$SCRIPT_DIR/config_hh-standalone" ]; then
+         echo "Error: Expected configuration folders not found in downloaded archive."
+         exit 1
+    fi
+    echo "Configurations downloaded successfully."
+fi
+
+
+
+echo "========================================================="
+echo "   Happy Hare + Qidi Q2 Installer (01.01.02+ firmware)  "
+echo "========================================================="
+echo ""
+echo "This installer is specifically for Q2 printers running"
+echo "firmware 01.01.02+. For legacy firmware (1.1.0/1.1.1),"
+echo "use install-bb-q2.sh instead."
+echo ""
+
+if is_bb_installed; then
+    BB_UPDATE=1
+    echo "Existing Happy Hare / bunnybox install detected."
+    echo "  1) Reinstall / update (re-apply configuration)"
+    echo "  2) Cancel"
+    read -p "Select [1/2, default 1]: " BB_ACTION </dev/tty
+    case "$BB_ACTION" in
+        2) echo "Cancelled."; exit 0 ;;
+        *) echo "Proceeding with reinstall." ;;
+    esac
+else
+    echo "This script will automate the installation of Happy Hare"
+    echo "and configure your Qidi Q2 for standalone usage."
+    echo "Please ensure you have read the README."
+    echo ""
+    echo "IMPORTANT: Unload all filament from the box BEFORE installing."
+    echo "After install you cannot load/unload until calibration, and gear"
+    echo "calibration needs the filament cut flush at the gate (not loaded)."
+    echo ""
+    read -p "Do you want to continue? (y/n) " -n 1 -r </dev/tty
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        exit 1
+    fi
+fi
+
+echo ""
+echo "==> Using Configuration Variant: config_hh-standalone (Recommended)"
+CONFIG_VARIANT="config_hh-standalone"
+
+if [ ! -d "$SCRIPT_DIR/$CONFIG_VARIANT" ]; then
+    echo "Error: $CONFIG_VARIANT directory not found in $SCRIPT_DIR"
+    exit 1
+fi
+
+if [ "$BB_UPDATE" -eq 1 ]; then
+    # Existing install: merge new defaults into the user's config instead of
+    # overwriting, preserving customisations and calibration.
+    smart_update_configs
+else
+    echo ""
+    echo "==> Copying configuration files from $CONFIG_VARIANT..."
+    # Copy the Happy Hare MMU directory from the chosen variant into Klipper config
+    sudo cp -r "$SCRIPT_DIR/$CONFIG_VARIANT/mmu" "$CONFIG_DIR/"
+    sudo chmod -R 644 "$CONFIG_DIR/mmu"
+    sudo find "$CONFIG_DIR/mmu" -type d -exec chmod 755 {} \;
+    # Copy the custom macros specific to the Q2 integration
+    sudo cp "$SCRIPT_DIR/$CONFIG_VARIANT/bunnybox_macros.cfg" "$CONFIG_DIR/"
+    sudo chmod 644 "$CONFIG_DIR/bunnybox_macros.cfg"
+    echo "Configurations copied."
+fi
+
+# Record the manifest + pristine base snapshot so the NEXT update can do a
+# 3-way merge and show a changelog. Runs for both fresh installs and updates.
+write_install_manifest
+
+echo ""
+echo "==> Configuring Serial Address..."
+# Find serial devices
+SERIAL_ID=""
+DETECTED_SERIAL=""
+if [ -d "/dev/serial/by-id" ]; then
+    DETECTED_SERIAL=$(find /dev/serial/by-id -maxdepth 1 -iname "*QIDI_BOX*" 2>/dev/null | head -n 1)
+fi
+
+if [ -n "$DETECTED_SERIAL" ]; then
+    echo "Autodetected Qidi Box at: $DETECTED_SERIAL"
+    read -p "Use this serial port? (Y/n) " USE_DETECTED </dev/tty
+    if [[ -z "$USE_DETECTED" ]] || [[ "$USE_DETECTED" =~ ^[Yy]$ ]]; then
+        SERIAL_ID="$DETECTED_SERIAL"
+    fi
+fi
+
+if [ -z "$SERIAL_ID" ]; then
+    SERIAL_DEVICES=()
+    while IFS= read -r dev; do
+        SERIAL_DEVICES+=("$dev")
+    done < <(find /dev/serial/by-id -mindepth 1 -maxdepth 1 2>/dev/null | sort)
+
+    if [ ${#SERIAL_DEVICES[@]} -eq 0 ]; then
+        echo "No serial devices found in /dev/serial/by-id"
+        echo ""
+        read -p "Enter your printer's serial ID path manually: " SERIAL_ID </dev/tty
+    else
+        echo "Available serial devices:"
+        for i in "${!SERIAL_DEVICES[@]}"; do
+            printf "  %d) %s\n" "$((i+1))" "${SERIAL_DEVICES[$i]}"
+        done
+        echo ""
+        read -p "Select serial device (1-${#SERIAL_DEVICES[@]}, or paste a full path): " SERIAL_SELECTION </dev/tty
+        if [[ "$SERIAL_SELECTION" =~ ^[0-9]+$ ]] && [ "$SERIAL_SELECTION" -ge 1 ] && [ "$SERIAL_SELECTION" -le "${#SERIAL_DEVICES[@]}" ]; then
+            SERIAL_ID="${SERIAL_DEVICES[$((SERIAL_SELECTION-1))]}"
+            echo "Selected: $SERIAL_ID"
+        else
+            SERIAL_ID="$SERIAL_SELECTION"
+        fi
+    fi
+fi
+if [ -n "$SERIAL_ID" ]; then
+    MMU_CFG="$CONFIG_DIR/mmu/base/mmu.cfg"
+    if [ -f "$MMU_CFG" ]; then
+        # Replace the serial line (anchored so only top-level `serial:` entries match,
+        # not commented lines or keys like `custom_serial:`)
+        tmp_cfg=$(mktemp)
+        awk -v serial="$SERIAL_ID" '{sub(/^[[:space:]]*serial:.*/, "serial: " serial)} 1' "$MMU_CFG" > "$tmp_cfg"
+        sudo mv "$tmp_cfg" "$MMU_CFG"
+        sudo chmod 644 "$MMU_CFG"
+        echo "Updated serial in mmu.cfg"
+    else
+        echo "Warning: mmu.cfg not found at $MMU_CFG"
+    fi
+else
+    echo "Warning: No serial ID provided. You will need to update mmu.cfg manually."
+fi
+
+echo ""
+echo "==> Installing Happy Hare from Qidi Box fork..."
+# Install the core Happy Hare software from its repository on the 'bunnybox' branch.
+HH_DIR="$HOME_DIR/Happy-Hare"
+if [ -d "$HH_DIR" ]; then
+    echo "Happy-Hare repository already exists at $HH_DIR. Pulling latest..."
+    cd "$HH_DIR"
+    git fetch
+    git checkout bunnybox
+    git pull --rebase || {
+        echo "Warning: git pull failed (likely due to upstream rebase). Resetting to match remote..."
+        git reset --hard origin/bunnybox
+    }
+    cd - >/dev/null
+else
+    git clone -b bunnybox https://github.com/Wazzup77/Happy-Hare.git "$HH_DIR"
+fi
+
+echo "Running Happy Hare install script..."
+if [ -f "$HH_DIR/install.sh" ]; then
+    echo "Happy Hare install script may prompt you for inputs."
+    cd "$HH_DIR"
+    ./install.sh </dev/tty
+    cd - >/dev/null
+else
+    echo "Error: install.sh not found in Happy-Hare repo!"
+fi
+
+echo ""
+echo "==> Applying Q2 patched mmu_cut_tip.cfg (overriding Happy Hare default)..."
+sudo cp "$SCRIPT_DIR/$CONFIG_VARIANT/mmu/base/mmu_cut_tip.cfg" \
+   "$CONFIG_DIR/mmu/base/mmu_cut_tip.cfg" \
+   && echo "    mmu_cut_tip.cfg patched." \
+   || echo "    WARNING: Failed to copy mmu_cut_tip.cfg — check permissions."
+sudo chmod 644 "$CONFIG_DIR/mmu/base/mmu_cut_tip.cfg"
+
+echo ""
+echo "==> Setting mmu__revision = 0 in saved_variables.cfg"
+# Required by Happy Hare: It looks for 'mmu__revision' in the saved_variables.cfg.
+SV_CFG="$CONFIG_DIR/saved_variables.cfg"
+if [ ! -f "$SV_CFG" ]; then
+    echo "[Variables]" | sudo tee "$SV_CFG" > /dev/null
+fi
+# safely remove existing variable and append it again
+tmp_sv=$(mktemp)
+sed '/^mmu__revision[[:space:]]*=/d' "$SV_CFG" > "$tmp_sv"
+echo "mmu__revision = 0" >> "$tmp_sv"
+sudo mv "$tmp_sv" "$SV_CFG"
+sudo chmod 644 "$SV_CFG"
+
+echo ""
+echo "==> Modifying printer.cfg and gcode_macro.cfg..."
+
+echo ""
+echo "==> Checking [idle_timeout] for drying state exclusion..."
+# Happy Hare's MMU_HEATER DRY=1 keeps the box heater running for hours. If the
+# stock [idle_timeout] fires during a drying cycle it will TURN_OFF_HEATERS and
+# kill the dry. Issue #29 — wrap the existing gcode so that drying-active idle
+# timeouts only zero the main printer heaters and leave the box untouched.
+APPLY_DRYING_EXCLUSION=0
+if [ -f "$CONFIG_DIR/printer.cfg" ] && grep -qE '^\[[[:space:]]*idle_timeout[[:space:]]*\]' "$CONFIG_DIR/printer.cfg"; then
+    echo "Found [idle_timeout] section in printer.cfg."
+    echo ""
+    echo "Happy Hare's filament drying (MMU_HEATER DRY=1) keeps the box heater"
+    echo "running for hours. With the stock idle_timeout gcode this will kill"
+    echo "the heaters mid-dry. The installer can wrap the gcode so that, when"
+    echo "drying is active, only extruder/heater_bed/chamber are zeroed and"
+    echo "the box heaters keep running. When not drying, the original gcode"
+    echo "runs unchanged."
+    read -p "Apply this modification? (Recommended) (Y/n) " DRYING_ANSWER </dev/tty
+    if [[ -z "$DRYING_ANSWER" ]] || [[ "$DRYING_ANSWER" =~ ^[Yy]$ ]]; then
+        APPLY_DRYING_EXCLUSION=1
+    fi
+else
+    echo "No [idle_timeout] section found in printer.cfg - skipping drying exclusion."
+fi
+export APPLY_DRYING_EXCLUSION
+
+# We use python because it handles multiline parsing and regex matching safely.
+# This prevents bash escaping issues when modifying the configuration files.
+export CONFIG_DIR
+python3 - << 'EOF'
+import os
+import re
+import tempfile
+import subprocess
+
+config_dir = os.environ.get("CONFIG_DIR", os.path.expanduser("~/printer_data/config"))
+printer_cfg_path = os.path.join(config_dir, "printer.cfg")
+gcode_macro_cfg_path = os.path.join(config_dir, "gcode_macro.cfg")
+
+def sudo_write(path, text, encoding=None):
+    # printer_data/config files are 644 and owned by 'qidi' on 01.01.02+
+    # firmware, so a direct open(path, 'w') from the normal user fails.
+    # Write to a temp file, then move it into place with sudo.
+    tmp = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.cfg', encoding=encoding)
+    tmp.write(text)
+    tmp.close()
+    result = subprocess.run(['sudo', 'mv', tmp.name, path], capture_output=True)
+    if result.returncode != 0:
+        print(f"ERROR: Failed to write {path}: {result.stderr.decode()}")
+        return False
+    subprocess.run(['sudo', 'chmod', '644', path])
+    return True
+
+def modify_printer_cfg():
+    if not os.path.exists(printer_cfg_path):
+        print(f"Warning: {printer_cfg_path} not found.")
+        return None
+
+    with open(printer_cfg_path, 'r') as f:
+        content = f.read()
+
+    # 1. Comment Qidi's stock box config `[include box.cfg]`
+    content = re.sub(r'(?m)^\[include\s+box\.cfg\].*$', '# [include box.cfg] # Removed by Happy Hare installer', content)
+
+    # 2. Add `[include bunnybox_macros.cfg]` at the top if not present
+    if '[include bunnybox_macros.cfg]' not in content:
+        content = '[include bunnybox_macros.cfg]\n' + content
+        
+    # 3. Detect the stock filament switch sensor's pin, then ensure it is declared
+    # in `[duplicate_pin_override]`. Qidi stock names the toolhead MCU THR;
+    # FreeDi/Kalico may name it differently, so we copy whatever the stock sensor
+    # uses rather than hardcoding THR:PA1 (a wrong MCU name fails to load).
+    dup_pin = 'THR:PA1'
+    mmu_switch_pin = None
+    _sec = re.search(r'(?ms)^\[filament_switch_sensor\s+filament_switch_sensor\]\s*\n(.*?)(?=^\[|\Z)', content)
+    if _sec:
+        _pm = re.search(r'(?m)^\s*switch_pin\s*:\s*(\S+)', _sec.group(1))
+        if _pm:
+            mmu_switch_pin = _pm.group(1)             # full spec, e.g. !THR:PA1
+            dup_pin = mmu_switch_pin.lstrip('!^~')    # bare pin for the override
+
+    # Klipper accepts multi-line values (indented continuation lines), so we
+    # collect the full pins value (inline + continuations) and rewrite it as a
+    # single comma-separated line. This also repairs a previously-broken file
+    # where the installer left an orphaned continuation line after overwriting.
+    if '[duplicate_pin_override]' not in content:
+        content = f'[duplicate_pin_override]\npins: {dup_pin}\n\n' + content
+    else:
+        dup_lines = content.split('\n')
+        dup_new_lines = []
+        in_dup_section = False
+        in_pins_value = False
+        pins_list = []
+        pins_emitted = False
+
+        for dup_line in dup_lines:
+            stripped = dup_line.strip()
+
+            if stripped == '[duplicate_pin_override]':
+                in_dup_section = True
+                in_pins_value = False
+                dup_new_lines.append(dup_line)
+                continue
+
+            if in_dup_section and stripped.startswith('['):
+                if not pins_emitted:
+                    if dup_pin not in pins_list:
+                        pins_list.append(dup_pin)
+                    dup_new_lines.append('pins: ' + ', '.join(pins_list))
+                    pins_emitted = True
+                in_dup_section = False
+                in_pins_value = False
+                dup_new_lines.append(dup_line)
+                continue
+
+            if in_dup_section:
+                if stripped.startswith('pins:'):
+                    _, inline_val = dup_line.split(':', 1)
+                    pins_list.extend([p.strip() for p in inline_val.replace(',', ' ').split() if p.strip()])
+                    in_pins_value = True
+                    continue
+                if in_pins_value and stripped and dup_line[0] in (' ', '\t'):
+                    pins_list.extend([p.strip() for p in stripped.replace(',', ' ').split() if p.strip()])
+                    continue
+                if in_pins_value:
+                    if not pins_emitted:
+                        if dup_pin not in pins_list:
+                            pins_list.append(dup_pin)
+                        dup_new_lines.append('pins: ' + ', '.join(pins_list))
+                        pins_emitted = True
+                    in_pins_value = False
+
+            dup_new_lines.append(dup_line)
+
+        if in_dup_section and not pins_emitted:
+            if dup_pin not in pins_list:
+                pins_list.append(dup_pin)
+            dup_new_lines.append('pins: ' + ', '.join(pins_list))
+
+        content = '\n'.join(dup_new_lines)
+
+    # 4. Make sure Happy Hare files are included: `[include mmu/base/*.cfg]`
+    if '[include mmu/base/*.cfg]' not in content:
+        content = '[include mmu/base/*.cfg]\n' + content
+    if '[include mmu/optional/client_macros.cfg]' not in content:
+        content = '[include mmu/optional/client_macros.cfg]\n' + content
+
+    lines = content.split('\n')
+    in_filament_sensor = False
+    new_lines = []
+    
+    # These properties from the stock filament switch sensor MUST be disabled
+    # or they will conflict directly with the MMU operation.
+    lines_to_comment = [
+        'runout_gcode',
+        'insert_gcode',
+        'M118 Filament run out',
+        'can_auto_reload',
+        'AUTO_RELOAD_FILAMENT',
+        '{% endif %}',
+        '{% if'
+    ]
+
+    for line in lines:
+        if line.strip().startswith('[filament_switch_sensor filament_switch_sensor]'):
+            in_filament_sensor = True
+            new_lines.append(line)
+            continue
+        elif in_filament_sensor and line.strip().startswith('['):
+            in_filament_sensor = False
+
+        if in_filament_sensor and line.strip():
+            if not line.strip().startswith('#'):
+                # Explicitly set pause_on_runout to False instead of commenting it out,
+                # because Klipper defaults to True when the line is commented out.
+                if 'pause_on_runout' in line:
+                    line = 'pause_on_runout: False'
+                else:
+                    should_comment = False
+                    for p in lines_to_comment:
+                        if p in line:
+                            should_comment = True
+                            break
+                    if should_comment:
+                        line = '# ' + line
+
+        new_lines.append(line)
+
+    sudo_write(printer_cfg_path, '\n'.join(new_lines))
+    print("Modified printer.cfg successfully.")
+    if mmu_switch_pin:
+        print(f"Detected stock filament switch pin {mmu_switch_pin} "
+              f"(duplicate_pin_override: {dup_pin}).")
+    return mmu_switch_pin
+
+def sync_extruder_switch_pin(switch_pin):
+    # Point the MMU's extruder_switch_pin at whatever pin the stock filament
+    # switch sensor used (captured by modify_printer_cfg). On Qidi stock this is
+    # !THR:PA1 and the rewrite is a no-op; on FreeDi/Kalico where the toolhead is
+    # a separate MCU under a different name, this binds the MMU to the real pin
+    # instead of a hardcoded THR that may not exist.
+    if not switch_pin:
+        print("Note: no stock [filament_switch_sensor filament_switch_sensor] switch_pin found;")
+        print("      leaving mmu_hardware.cfg extruder_switch_pin unchanged.")
+        return
+    hw_path = os.path.join(config_dir, "mmu", "base", "mmu_hardware.cfg")
+    if not os.path.exists(hw_path):
+        print(f"Note: {hw_path} not found; skipping extruder switch pin sync.")
+        return
+    # mmu_hardware.cfg contains UTF-8 box-art comments; pin encoding explicitly.
+    with open(hw_path, 'r', encoding='utf-8') as f:
+        hw = f.read()
+    hw, n = re.subn(r'(?m)^(\s*extruder_switch_pin\s*:\s*)\S+',
+                    lambda m: m.group(1) + switch_pin, hw)
+    sudo_write(hw_path, hw, encoding='utf-8')
+    if n:
+        print(f"Synced MMU extruder_switch_pin from stock sensor -> {switch_pin}")
+    else:
+        print("Note: extruder_switch_pin line not found in mmu_hardware.cfg; no change.")
+
+def modify_gcode_macro_cfg():
+    if not os.path.exists(gcode_macro_cfg_path):
+        print(f"Warning: {gcode_macro_cfg_path} not found.")
+        return
+
+    with open(gcode_macro_cfg_path, 'r') as f:
+        content = f.read()
+
+    # 1. Modify PRINT_START conditions
+    # This matches spacing safely
+    content = content.replace(
+        '{% if printer.save_variables.variables.box_count >= 1 %}',
+        '{% if printer.mmu.num_gates >= 4 %}'
+    )
+    content = content.replace(
+        '{% if printer.save_variables.variables.enable_box == 1 %}',
+        '{% if printer.mmu.enabled %}'
+    )
+
+    # 2. Comment out PAUSE, RESUME_PRINT, RESUME, CANCEL_PRINT, CLEAR_PAUSE,
+    # DETECT_INTERRUPTION blocks entirely. Klipper gcode command names are
+    # case-insensitive, so the match here is too — the Max4 stock config, for
+    # example, uses lowercase `[gcode_macro pause]`. CLEAR_PAUSE is included
+    # because some stock variants override it with a macro that references
+    # variables on RESUME_PRINT; leaving it active after we delete
+    # RESUME_PRINT would make the UI's "Clear Pause" button throw at runtime.
+    # DETECT_INTERRUPTION is commented out because bunnybox_macros.cfg
+    # provides a no-op replacement. We comment rather than `rename_existing`
+    # so it also works on mainline Klipper / FreeDi installs where the stock
+    # macro may be absent — `rename_existing` would otherwise fail with
+    # "Existing command 'DETECT_INTERRUPTION' not found in gcode_macro rename".
+    lines = content.split('\n')
+    new_lines = []
+    in_macro_to_comment = False
+    macros_to_comment = {'pause', 'resume_print', 'resume', 'cancel_print', 'clear_pause', 'detect_interruption'}
+    section_re = re.compile(r'^\[gcode_macro\s+([A-Za-z_][A-Za-z0-9_]*)\s*\]')
+
+    for line in lines:
+        stripped = line.strip()
+        match = section_re.match(stripped)
+        if match and match.group(1).lower() in macros_to_comment:
+            in_macro_to_comment = True
+        elif in_macro_to_comment and stripped.startswith('['):
+            in_macro_to_comment = False
+
+        if in_macro_to_comment and not stripped.startswith('#'):
+            new_lines.append('# ' + line)
+        else:
+            new_lines.append(line)
+
+    # 3. Comment out the `save_last_file` call site(s) in PRINT_START.
+    # save_last_file is Qidi's power-loss recovery hook (defined on the Q2 in
+    # plr.cfg: stashes file path, temps, and sets was_interrupted=True in
+    # saved_variables.cfg on every print start). PLR is disabled under HH
+    # (see DETECT_INTERRUPTION override in bunnybox_macros.cfg), so we stop
+    # it being called in the first place — otherwise was_interrupted would
+    # be written True every print and only cleared at next boot by our
+    # DETECT_INTERRUPTION override, which is fine but untidy.
+    out_lines = []
+    for line in new_lines:
+        stripped = line.strip()
+        if stripped == 'save_last_file' or stripped.lower() == 'save_last_file':
+            out_lines.append('# ' + line)
+        else:
+            out_lines.append(line)
+    new_lines = out_lines
+
+    sudo_write(gcode_macro_cfg_path, '\n'.join(new_lines))
+    print("Modified gcode_macro.cfg successfully.")
+
+def modify_idle_timeout():
+    # Issue #29: Happy Hare's filament drying (MMU_HEATER DRY=1) keeps the box
+    # heater running for hours, but the stock [idle_timeout] gcode (Klipper's
+    # default TURN_OFF_HEATERS+M84, or Qidi's PRINT_END) will kill the heaters
+    # during the dry. Wrap whatever gcode is in [idle_timeout] so that when
+    # drying is active only the main printer heaters are zeroed; otherwise the
+    # original gcode runs unchanged.
+    if os.environ.get("APPLY_DRYING_EXCLUSION", "0") != "1":
+        return
+    if not os.path.exists(printer_cfg_path):
+        return
+
+    with open(printer_cfg_path, 'r') as f:
+        content = f.read()
+
+    lines = content.split('\n')
+    section_re = re.compile(r'^\s*\[([^\]]+)\]\s*$')
+
+    start = -1
+    for idx, ln in enumerate(lines):
+        m = section_re.match(ln)
+        if m and m.group(1).strip() == 'idle_timeout':
+            start = idx
+            break
+    if start < 0:
+        print("No [idle_timeout] section in printer.cfg - skipping drying exclusion.")
+        return
+
+    end = len(lines)
+    for idx in range(start + 1, len(lines)):
+        if section_re.match(lines[idx]):
+            end = idx
+            break
+
+    # Idempotent guard: re-running the installer must not double-wrap. Scope
+    # the check to uncommented lines inside [idle_timeout] so that incidental
+    # matches elsewhere in printer.cfg (commented remnants of a prior wrap,
+    # unrelated macros that reference drying_state, etc.) don't suppress the
+    # modification.
+    already_wrapped = any(
+        'printer.mmu.drying_state' in ln
+        for ln in lines[start:end]
+        if not ln.lstrip().startswith('#')
+    )
+    if already_wrapped:
+        print("[idle_timeout] already has drying state exclusion - skipping.")
+        return
+
+    gcode_idx = -1
+    for idx in range(start + 1, end):
+        if re.match(r'^\s*gcode\s*:', lines[idx]):
+            gcode_idx = idx
+            break
+
+    DRY_ON = [
+        "SET_HEATER_TEMPERATURE HEATER=extruder TARGET=0",
+        "SET_HEATER_TEMPERATURE HEATER=heater_bed TARGET=0",
+        "SET_HEATER_TEMPERATURE HEATER=chamber TARGET=0",
+    ]
+    GUARD = "{% if printer.mmu is defined and printer.mmu.drying_state[0] == 'active' %}"
+    ELSE = "{% else %}"
+    ENDIF = "{% endif %}"
+
+    if gcode_idx == -1:
+        # No gcode: key in the section — Klipper falls back to its implicit
+        # default of TURN_OFF_HEATERS + M84. Insert a new gcode: block at the
+        # end of the section (before any trailing blank lines).
+        indent = '    '
+        inner = indent + '  '
+        block = ['gcode:', indent + GUARD]
+        for cmd in DRY_ON:
+            block.append(inner + cmd)
+        block.append(indent + ELSE)
+        block.append(inner + "TURN_OFF_HEATERS")
+        block.append(inner + "M84")
+        block.append(indent + ENDIF)
+
+        insert_at = end
+        while insert_at > start + 1 and lines[insert_at - 1].strip() == '':
+            insert_at -= 1
+        new_lines = lines[:insert_at] + block + lines[insert_at:]
+        sudo_write(printer_cfg_path, '\n'.join(new_lines))
+        print("Added gcode: block with drying state exclusion to [idle_timeout].")
+        return
+
+    # Existing gcode: block — wrap its body.
+    gcode_line = lines[gcode_idx]
+    _, inline = gcode_line.split(':', 1)
+    inline_stripped = inline.strip()
+
+    body_start = gcode_idx + 1
+    body_end = body_start
+    indent = None
+    while body_end < end:
+        ln = lines[body_end]
+        if ln.strip() == '':
+            body_end += 1
+            continue
+        if ln[:1] not in (' ', '\t'):
+            break
+        if indent is None:
+            indent = ln[:len(ln) - len(ln.lstrip())]
+        body_end += 1
+
+    # Roll back past trailing blank lines so they stay outside the wrapper.
+    while body_end - 1 >= body_start and lines[body_end - 1].strip() == '':
+        body_end -= 1
+
+    if indent is None:
+        indent = '    '
+    inner = indent + '  '
+
+    body = lines[body_start:body_end]
+    if inline_stripped:
+        body = [indent + inline_stripped] + body
+
+    wrapped = [indent + GUARD]
+    for cmd in DRY_ON:
+        wrapped.append(inner + cmd)
+    wrapped.append(indent + ELSE)
+    for b in body:
+        if b.strip() == '':
+            wrapped.append(b)
+        else:
+            wrapped.append('  ' + b)
+    wrapped.append(indent + ENDIF)
+
+    # Strip any inline content from the gcode: line — it was hoisted into body.
+    new_gcode_line = re.sub(r'^(\s*gcode\s*:).*$', r'\1', gcode_line)
+
+    new_lines = lines[:gcode_idx] + [new_gcode_line] + wrapped + lines[body_end:]
+    sudo_write(printer_cfg_path, '\n'.join(new_lines))
+    print("Wrapped [idle_timeout] gcode with drying state exclusion.")
+
+try:
+    mmu_switch_pin = modify_printer_cfg()
+    sync_extruder_switch_pin(mmu_switch_pin)
+    modify_gcode_macro_cfg()
+    modify_idle_timeout()
+except Exception as e:
+    print(f"Error during python modification script: {e}")
+
+EOF
+
+echo ""
+echo "==> Patching klippy.py to remove QIDI box_detect dependency..."
+# QIDI's stock Klipper image ships a customised klippy.py that imports the
+# closed-source `extras/box_detect.so` and calls into it during _connect.
+# That .so is missing on mainline Klipper / Kalico / FreeDi and breaks any
+# attempt to update Python, so we strip the four QIDI-injected sites here.
+# Detection is by string match — stock/mainline/Kalico klippy.py contains
+# nothing like it and the patch is a no-op there.
+KLIPPY_PY="$HOME/klipper/klippy/klippy.py"
+if [ ! -f "$KLIPPY_PY" ]; then
+    echo "Note: klippy.py not found at $KLIPPY_PY; skipping."
+elif ! grep -q "^from extras import box_detect" "$KLIPPY_PY"; then
+    echo "No QIDI box_detect references found in klippy.py — skipping (stock/mainline/Kalico)."
+else
+    echo "QIDI box_detect references detected — patching klippy.py..."
+    KLIPPY_SUDO=""
+    if [ ! -w "$KLIPPY_PY" ] && command -v sudo >/dev/null 2>&1; then
+        KLIPPY_SUDO="sudo"
+    fi
+    KLIPPY_OWNER=""
+    KLIPPY_OWNER=$(stat -c '%U:%G' "$KLIPPY_PY" 2>/dev/null || true)
+    if [ ! -f "${KLIPPY_PY}.bunnybox.bak" ]; then
+        $KLIPPY_SUDO cp "$KLIPPY_PY" "${KLIPPY_PY}.bunnybox.bak"
+        echo "Original saved to ${KLIPPY_PY}.bunnybox.bak"
+    fi
+    tmp_klippy=$(mktemp)
+    KLIPPY_PY_PATH="$KLIPPY_PY" python3 - "$tmp_klippy" <<'PYEOF'
+import os, re, sys
+src = os.environ["KLIPPY_PY_PATH"]
+dst = sys.argv[1]
+with open(src, 'r') as f:
+    content = f.read()
+content = re.sub(r'(?m)^from extras import box_detect[ \t]*\r?\n', '', content)
+content = re.sub(r'(?m)^import pyudev, shutil, configparser[ \t]*\r?\n', '', content)
+content = re.sub(
+    r'(?m)^[ \t]*for m in \[box_detect\]:[ \t]*\r?\n[ \t]+m\.add_printer_objects\(config\)[ \t]*\r?\n',
+    '',
+    content,
+)
+content = re.sub(
+    r'(?m)^[ \t]*box_detect\.monitor_serial_devices\(self\)[ \t]*\r?\n',
+    '',
+    content,
+)
+with open(dst, 'w') as f:
+    f.write(content)
+PYEOF
+    if [ -s "$tmp_klippy" ]; then
+        $KLIPPY_SUDO mv "$tmp_klippy" "$KLIPPY_PY"
+        if [ -n "$KLIPPY_SUDO" ] && [ -n "$KLIPPY_OWNER" ]; then
+            $KLIPPY_SUDO chown "$KLIPPY_OWNER" "$KLIPPY_PY" || echo "Warning: failed to restore ownership of klippy.py"
+        fi
+        echo "Patched klippy.py — QIDI box_detect references removed."
+    else
+        echo "Error: patched klippy.py would be empty; aborting patch."
+        rm -f "$tmp_klippy"
+    fi
+fi
+
+echo ""
+echo "==> Environment Sensor Installation..."
+read -p "Do you want to install the custom AHT10 environment sensor module? (Recommended) (Y/n) " INSTALL_AHT10 </dev/tty
+if [[ -z "$INSTALL_AHT10" ]] || [[ "$INSTALL_AHT10" =~ ^[Yy]$ ]]; then
+    echo "Installing custom aht10.py module..."
+    EXTRAS_DIR="$HOME/klipper/klippy/extras"
+    if [ -d "$EXTRAS_DIR" ]; then
+        cd "$EXTRAS_DIR"
+        
+        
+        # Download to temp file first, verify integrity, then move into place.
+        # Prefer curl -fsSL (fails on HTTP errors); fall back to wget.
+        tmp_aht=$(mktemp)
+        AHT10_URL="https://raw.githubusercontent.com/Wazzup77/Bunny-Box/refs/heads/main/aht10.py"
+        dl_ok=1
+        if command -v curl >/dev/null 2>&1; then
+            curl -fsSLo "$tmp_aht" "$AHT10_URL" && dl_ok=0
+        elif command -v wget >/dev/null 2>&1; then
+            wget -qO "$tmp_aht" "$AHT10_URL" && dl_ok=0
+        fi
+        if [ $dl_ok -eq 0 ] && [ -s "$tmp_aht" ]; then
+            mv "$tmp_aht" aht10.py
+            echo "Successfully downloaded custom aht10.py module"
+        else
+            echo "Failed to download custom aht10.py module"
+            rm -f "$tmp_aht"
+        fi
+        
+        cd - >/dev/null
+    else
+        echo "Error: Could not find klipper extras directory at $EXTRAS_DIR"
+    fi
+else
+    echo "Skipping custom environment sensor module installation."
+fi
+
+echo ""
+echo "==> Restarting Klipper..."
+if command -v sudo >/dev/null 2>&1; then
+    sudo systemctl restart klipper || echo "Failed to restart klipper automatically. Please restart it manually."
+    sudo systemctl restart moonraker || echo "Failed to restart moonraker."
+else
+    echo "Could not find sudo. Please restart klipper manually."
+fi
+
+echo ""
+echo "========================================================="
+echo "   Installation Complete!                                "
+echo "========================================================="
+echo "Please remember to update slicer machine gcodes as specified in the README!"
+echo "If Happy Hare installation had any issues, check its output above."
+echo ""
+echo "Note: The installer added [duplicate_pin_override] so the stock"
+echo "[filament_switch_sensor] and the MMU can share the toolhead sensor pin"
+echo "(detected from your printer.cfg). For the"
+echo "cleanest setup you may comment out the stock [filament_switch_sensor"
+echo "filament_switch_sensor] section once the MMU is verified working."
+echo ""
+echo "#########################################################"
+echo "##                                                     ##"
+echo "##   !!  STOP  -  CALIBRATION IS REQUIRED  !!          ##"
+echo "##                                                     ##"
+echo "#########################################################"
+echo ""
+echo "Happy Hare is INSTALLED but NOT yet CALIBRATED. It will NOT"
+echo "load filament or print reliably until you calibrate it."
+echo ""
+echo "On the Q2 you MUST do this before your first print:"
+echo "  1. GEAR calibration -> MMU_CALIBRATE_GEAR"
+echo ""
+echo "Optional (recommended later): MMU_CALIBRATE_BOWDEN"
+echo ""
+echo "Follow the step-by-step CALIBRATION section in the README, and the"
+echo "official guide here:"
+echo "  https://github.com/moggieuk/Happy-Hare/wiki/MMU-Calibration-TypeB"
+echo ""
+echo "#########################################################"
+echo ""

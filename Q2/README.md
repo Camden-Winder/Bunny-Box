@@ -13,7 +13,13 @@ The easiest way to install Happy Hare on your Qidi Q2 is to use the provided aut
    ```bash
    wget -qO - https://raw.githubusercontent.com/Camden-Winder/Bunny-Box/refs/heads/main/Q2/install-bb-q2.sh | bash
    ```
-   
+
+> [!NOTE]
+> **Running firmware 01.01.02 or newer?** Use `install-bb-q2-112.sh` instead — it handles the `/home/qidi` path change and permission requirements introduced in that firmware:
+> ```bash
+> wget -qO - https://raw.githubusercontent.com/Camden-Winder/Bunny-Box/refs/heads/main/Q2/install-bb-q2-112.sh | bash
+> ```
+
 The script will backup your configurations, download the necessary files, prompt you for your serial ID, and automatically install Happy Hare.
 
 Don't forget to update the machine gcodes in the slicer to use the ones provided in the [slicer_machine_gcodes.md](./config_hh-standalone/slicer_machine_gcodes.md).
